@@ -43,6 +43,12 @@ const MIN_DEADLINE_OFFSET: u32 = 10;
 /// ledgers (~365 days at 5s per ledger ≈ 6.3M sequences).
 const MAX_DEADLINE_OFFSET: u32 = 6_307_200;
 
+/// Automatic payout timeout window in ledger sequences. If the anchor fails
+/// to signal fiat payout completion within this window (~24 hours at 5s per
+/// ledger = 86_400s / 5 = 17_280 sequences), the locked funds may be
+/// refunded to the sender.
+pub const PAYOUT_TIMEOUT_LEDGERS: u32 = 17_280;
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -74,6 +80,14 @@ pub enum HtlcState {
     Claimed,
     /// Depositor refunded after deadline.
     Refunded,
+    /// Payment record created but funds not yet locked in escrow.
+    Pending,
+    /// Funds locked in escrow awaiting anchor payout.
+    Locked,
+    /// Anchor has dispatched the off-ledger fiat payout.
+    Dispatched,
+    /// Anchor has confirmed the fiat payout completed and funds released.
+    Settled,
 }
 
 /// A single HTLC record.
@@ -303,6 +317,94 @@ pub fn claim(
 }
 
 // ---------------------------------------------------------------------------
+// Anchor settlement (fiat payout completion)
+// ---------------------------------------------------------------------------
+
+/// Signal that the anchor (beneficiary) has completed the off-ledger fiat
+/// payout, releasing the locked escrow funds.
+///
+/// This is the fiat-corridor counterpart to [`claim`]: instead of proving a
+/// SHA-256 pre-image, the anchor keypair attests that the fiat payout has
+/// completed. Only the designated anchor (the `beneficiary`) may call this,
+/// and only before the payout deadline elapses. If the anchor never settles
+/// within the [`PAYOUT_TIMEOUT_LEDGERS`] window encoded in
+/// `deadline_sequence`, the sender reclaims the funds via [`refund`].
+///
+/// On success the HTLC transitions to [`HtlcState::Settled`].
+///
+/// # Arguments
+/// * `env` - Soroban environment.
+/// * `htlc_id` - The HTLC to settle.
+/// * `caller` - The anchor address (must equal the `beneficiary`).
+///
+/// # Errors
+/// * [`ContractError::HtlcNotFound`] if no HTLC exists with this ID.
+/// * [`ContractError::HtlcNotActive`] if already settled or refunded.
+/// * [`ContractError::DeadlineReached`] if the payout window has elapsed.
+/// * [`ContractError::Unauthorized`] if the caller is not the anchor.
+pub fn anchor_settle(
+    env: &Env,
+    htlc_id: u64,
+    caller: Address,
+) -> Result<ClaimResult, ContractError> {
+    caller.require_auth();
+
+    let key = HtlcKey(htlc_id);
+    let mut htlc: Htlc = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(ContractError::HtlcNotFound)?;
+
+    // ── Authorization: only the anchor (beneficiary) may settle ─────────
+    if htlc.beneficiary != caller {
+        return Err(ContractError::Unauthorized);
+    }
+
+    // ── State check — must still be locked/active ──────────────────────
+    if htlc.state != HtlcState::Active && htlc.state != HtlcState::Locked {
+        return Err(ContractError::HtlcNotActive);
+    }
+
+    // ── Payout window — anchor must settle before the deadline ──────────
+    let current_seq = env.ledger().sequence();
+    if current_seq >= htlc.deadline_sequence {
+        return Err(ContractError::DeadlineReached);
+    }
+
+    // ── State transition ───────────────────────────────────────────────
+    htlc.state = HtlcState::Settled;
+    env.storage().persistent().set(&key, &htlc);
+
+    // Decrement depositor active count.
+    let counter_key = HtlcCounterKey(htlc.depositor.clone());
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&counter_key)
+        .unwrap_or(1u32);
+    if count > 0 {
+        env.storage()
+            .persistent()
+            .set(&counter_key, &(count - 1));
+    }
+
+    // Emit settlement event.
+    let _ = emit_simple2(
+        &env,
+        EV_HTLC_CLAIM,
+        symbol_short!("settle"),
+        (htlc_id, caller, htlc.amount),
+    );
+
+    Ok(ClaimResult {
+        htlc_id,
+        amount: htlc.amount,
+        beneficiary: htlc.beneficiary,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Refund (time-lock expiry)
 // ---------------------------------------------------------------------------
 
@@ -436,9 +538,10 @@ mod tests {
     const TEST_ASSET: AssetId = 1;
     const TEST_AMOUNT: u64 = 10_000_000;
 
-    fn setup() -> (Env, Address, Address) {
+    fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
+        let contract_id = env.register_contract(None, crate::TimeLockedUpgradeContract);
         // Set a known ledger sequence so deadline math is predictable.
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000,
@@ -448,11 +551,11 @@ mod tests {
             base_reserve: 10,
             min_temp_entry_ttl: 0,
             min_persistent_entry_ttl: 0,
-            max_entry_ttl: u32::MAX,
+            max_entry_ttl: 6_312_000,
         });
         let depositor = Address::generate(&env);
         let beneficiary = Address::generate(&env);
-        (env, depositor, beneficiary)
+        (env, depositor, beneficiary, contract_id)
     }
 
     fn make_hash_preimage(pre_image: &[u8]) -> (Bytes, BytesN<32>) {
@@ -462,9 +565,8 @@ mod tests {
         (bytes, hash)
     }
 
-    fn make_pre_image(id: u64) -> Bytes {
-        let env = Env::default();
-        Bytes::from_slice(&env, &id.to_be_bytes())
+    fn make_pre_image(env: &Env, id: u64) -> Bytes {
+        Bytes::from_slice(env, &id.to_be_bytes())
     }
 
     fn make_hash(id: u64) -> BytesN<32> {
@@ -477,9 +579,9 @@ mod tests {
 
     #[test]
     fn create_htlc_success() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep.clone(), ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         assert_eq!(htlc.id, 1);
         assert_eq!(htlc.depositor, dep);
@@ -491,42 +593,42 @@ mod tests {
 
     #[test]
     fn create_htlc_increments_id() {
-        let (env, dep, ben) = setup();
-        let h1 = create_htlc(&env, dep.clone(), ben.clone(), make_hash(1), 200, TEST_ASSET, 100).unwrap();
-        let h2 = create_htlc(&env, dep.clone(), ben.clone(), make_hash(2), 300, TEST_ASSET, 200).unwrap();
+        let (env, dep, ben, cid) = setup();
+        let h1 = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben.clone(), make_hash(1), 200, TEST_ASSET, 100)).unwrap();
+        let h2 = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben.clone(), make_hash(2), 300, TEST_ASSET, 200)).unwrap();
         assert_eq!(h1.id + 1, h2.id);
     }
 
     #[test]
     fn create_htlc_rejects_zero_amount() {
-        let (env, dep, ben) = setup();
-        let result = create_htlc(&env, dep, ben, make_hash(1), 200, TEST_ASSET, 0);
+        let (env, dep, ben, cid) = setup();
+        let result = env.as_contract(&cid, || create_htlc(&env, dep, ben, make_hash(1), 200, TEST_ASSET, 0));
         assert_eq!(result, Err(ContractError::ZeroSwapAmount));
     }
 
     #[test]
     fn create_htlc_rejects_deadline_too_soon() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         // current seq = 100, deadline = 105 (< 100 + 10 = 110)
-        let result = create_htlc(&env, dep, ben, make_hash(1), 105, TEST_ASSET, TEST_AMOUNT);
+        let result = env.as_contract(&cid, || create_htlc(&env, dep, ben, make_hash(1), 105, TEST_ASSET, TEST_AMOUNT));
         assert_eq!(result, Err(ContractError::DeadlineTooSoon));
     }
 
     #[test]
     fn create_htlc_rejects_deadline_too_far() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         // current seq = 100, deadline = 100 + 6_307_200 + 1
-        let result = create_htlc(&env, dep, ben, make_hash(1), 100 + MAX_DEADLINE_OFFSET + 1, TEST_ASSET, TEST_AMOUNT);
+        let result = env.as_contract(&cid, || create_htlc(&env, dep, ben, make_hash(1), 100 + MAX_DEADLINE_OFFSET + 1, TEST_ASSET, TEST_AMOUNT));
         assert_eq!(result, Err(ContractError::DeadlineTooFar));
     }
 
     #[test]
     fn create_htlc_respects_max_active_limit() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         for i in 0..MAX_ACTIVE_HTLCS {
-            create_htlc(&env, dep.clone(), ben.clone(), make_hash(i as u64), 200 + i, TEST_ASSET, 1).unwrap();
+            env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben.clone(), make_hash(i as u64), 200 + i, TEST_ASSET, 1)).unwrap();
         }
-        let result = create_htlc(&env, dep, ben, make_hash(999), 500, TEST_ASSET, 1);
+        let result = env.as_contract(&cid, || create_htlc(&env, dep, ben, make_hash(999), 500, TEST_ASSET, 1));
         assert_eq!(result, Err(ContractError::TooManyActiveHtlcs));
     }
 
@@ -534,11 +636,11 @@ mod tests {
 
     #[test]
     fn claim_success() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
 
-        let htlc = create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         // Advance to seq 150 (before deadline 200).
         env.ledger().set(LedgerInfo {
@@ -546,34 +648,34 @@ mod tests {
             ..env.ledger().get()
         });
 
-        let result = claim(&env, htlc.id, pre_image, ben).unwrap();
+        let result = env.as_contract(&cid, || claim(&env, htlc.id, pre_image, ben)).unwrap();
         assert_eq!(result.amount, TEST_AMOUNT);
 
         // Verify state transition.
-        let stored = get_htlc(&env, htlc.id).unwrap();
+        let stored = env.as_contract(&cid, || get_htlc(&env, htlc.id)).unwrap();
         assert_eq!(stored.state, HtlcState::Claimed);
     }
 
     #[test]
     fn claim_rejects_invalid_preimage() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
 
-        let htlc = create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
-        let wrong_image = make_pre_image(99);
-        let result = claim(&env, htlc.id, wrong_image, ben);
+        let wrong_image = make_pre_image(&env, 99);
+        let result = env.as_contract(&cid, || claim(&env, htlc.id, wrong_image, ben));
         assert_eq!(result, Err(ContractError::InvalidPreImage));
     }
 
     #[test]
     fn claim_rejects_after_deadline() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
 
-        let htlc = create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         // Advance past deadline.
         env.ledger().set(LedgerInfo {
@@ -581,58 +683,58 @@ mod tests {
             ..env.ledger().get()
         });
 
-        let result = claim(&env, htlc.id, pre_image, ben);
+        let result = env.as_contract(&cid, || claim(&env, htlc.id, pre_image, ben));
         assert_eq!(result, Err(ContractError::DeadlineReached));
     }
 
     #[test]
     fn claim_rejects_wrong_caller() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
 
-        let htlc = create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         let wrong_caller = Address::generate(&env);
-        let result = claim(&env, htlc.id, pre_image, wrong_caller);
+        let result = env.as_contract(&cid, || claim(&env, htlc.id, pre_image, wrong_caller));
         assert_eq!(result, Err(ContractError::Unauthorized));
     }
 
     #[test]
     fn claim_rejects_already_claimed() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
 
-        let htlc = create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
-        claim(&env, htlc.id, pre_image, ben.clone()).unwrap();
+        env.as_contract(&cid, || claim(&env, htlc.id, pre_image, ben.clone())).unwrap();
 
-        let pre_image2 = make_pre_image(42);
-        let result = claim(&env, htlc.id, pre_image2, ben);
+        let pre_image2 = make_pre_image(&env, 42);
+        let result = env.as_contract(&cid, || claim(&env, htlc.id, pre_image2, ben));
         assert_eq!(result, Err(ContractError::HtlcNotActive));
     }
 
     #[test]
     fn claim_decrements_active_count() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
 
-        let _ = create_htlc(&env, dep.clone(), ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
-        assert_eq!(active_htlc_count(&env, &dep), 1);
+        let _ = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
+        assert_eq!(env.as_contract(&cid, || active_htlc_count(&env, &dep)), 1);
 
-        claim(&env, 1, pre_image, ben).unwrap();
-        assert_eq!(active_htlc_count(&env, &dep), 0);
+        env.as_contract(&cid, || claim(&env, 1, pre_image, ben)).unwrap();
+        assert_eq!(env.as_contract(&cid, || active_htlc_count(&env, &dep)), 0);
     }
 
     // ── Refund tests ──────────────────────────────────────────────────
 
     #[test]
     fn refund_success() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         // Advance past deadline.
         env.ledger().set(LedgerInfo {
@@ -640,29 +742,29 @@ mod tests {
             ..env.ledger().get()
         });
 
-        let result = refund(&env, htlc.id, dep.clone()).unwrap();
+        let result = env.as_contract(&cid, || refund(&env, htlc.id, dep.clone())).unwrap();
         assert_eq!(result.amount, TEST_AMOUNT);
 
-        let stored = get_htlc(&env, htlc.id).unwrap();
+        let stored = env.as_contract(&cid, || get_htlc(&env, htlc.id)).unwrap();
         assert_eq!(stored.state, HtlcState::Refunded);
     }
 
     #[test]
     fn refund_rejects_before_deadline() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         // Still at seq 100, deadline is 200.
-        let result = refund(&env, htlc.id, dep);
+        let result = env.as_contract(&cid, || refund(&env, htlc.id, dep));
         assert_eq!(result, Err(ContractError::DeadlineNotReached));
     }
 
     #[test]
     fn refund_rejects_wrong_caller() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         env.ledger().set(LedgerInfo {
             sequence_number: 200,
@@ -670,40 +772,40 @@ mod tests {
         });
 
         let wrong_caller = Address::generate(&env);
-        let result = refund(&env, htlc.id, wrong_caller);
+        let result = env.as_contract(&cid, || refund(&env, htlc.id, wrong_caller));
         assert_eq!(result, Err(ContractError::Unauthorized));
     }
 
     #[test]
     fn refund_rejects_already_refunded() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         env.ledger().set(LedgerInfo {
             sequence_number: 200,
             ..env.ledger().get()
         });
 
-        refund(&env, htlc.id, dep.clone()).unwrap();
-        let result = refund(&env, htlc.id, dep);
+        env.as_contract(&cid, || refund(&env, htlc.id, dep.clone())).unwrap();
+        let result = env.as_contract(&cid, || refund(&env, htlc.id, dep));
         assert_eq!(result, Err(ContractError::HtlcNotActive));
     }
 
     #[test]
     fn refund_decrements_active_count() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let _ = create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
-        assert_eq!(active_htlc_count(&env, &dep), 1);
+        let _ = env.as_contract(&cid, || create_htlc(&env, dep.clone(), ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
+        assert_eq!(env.as_contract(&cid, || active_htlc_count(&env, &dep)), 1);
 
         env.ledger().set(LedgerInfo {
             sequence_number: 200,
             ..env.ledger().get()
         });
 
-        refund(&env, 1, dep.clone()).unwrap();
-        assert_eq!(active_htlc_count(&env, &dep), 0);
+        env.as_contract(&cid, || refund(&env, 1, dep.clone())).unwrap();
+        assert_eq!(env.as_contract(&cid, || active_htlc_count(&env, &dep)), 0);
     }
 
     // ── Query helper tests ────────────────────────────────────────────
@@ -711,75 +813,79 @@ mod tests {
     #[test]
     fn get_htlc_not_found() {
         let env = Env::default();
-        let result = get_htlc(&env, 999);
+        let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        let result = env.as_contract(&cid, || get_htlc(&env, 999));
         assert_eq!(result, Err(ContractError::HtlcNotFound));
     }
 
     #[test]
     fn next_htlc_id_starts_at_zero() {
         let env = Env::default();
-        assert_eq!(next_htlc_id(&env), 0);
+        let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
+        assert_eq!(env.as_contract(&cid, || next_htlc_id(&env)), 0);
     }
 
     #[test]
     fn is_expired_true_after_deadline() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         env.ledger().set(LedgerInfo {
             sequence_number: 200,
             ..env.ledger().get()
         });
 
-        assert!(is_expired(&env, &htlc));
+        assert!(env.as_contract(&cid, || is_expired(&env, &htlc)));
     }
 
     #[test]
     fn is_expired_false_before_deadline() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
-        assert!(!is_expired(&env, &htlc));
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
+        assert!(!env.as_contract(&cid, || is_expired(&env, &htlc)));
     }
 
     #[test]
     fn is_claimable_true_before_deadline() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
-        assert!(is_claimable(&env, &htlc));
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
+        assert!(env.as_contract(&cid, || is_claimable(&env, &htlc)));
     }
 
     #[test]
     fn is_claimable_false_after_deadline() {
-        let (env, dep, ben) = setup();
+        let (env, dep, ben, cid) = setup();
         let hash_lock = make_hash(42);
-        let htlc = create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben, hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
         env.ledger().set(LedgerInfo {
             sequence_number: 200,
             ..env.ledger().get()
         });
 
-        assert!(!is_claimable(&env, &htlc));
+        assert!(!env.as_contract(&cid, || is_claimable(&env, &htlc)));
     }
 
     #[test]
     fn is_claimable_false_after_claim() {
-        let (env, dep, ben) = setup();
-        let pre_image = make_pre_image(42);
+        let (env, dep, ben, cid) = setup();
+        let pre_image = make_pre_image(&env, 42);
         let hash_lock = env.crypto().sha256(&pre_image);
-        let htlc = create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT).unwrap();
+        let htlc = env.as_contract(&cid, || create_htlc(&env, dep, ben.clone(), hash_lock, 200, TEST_ASSET, TEST_AMOUNT)).unwrap();
 
-        claim(&env, htlc.id, pre_image, ben).unwrap();
-        assert!(!is_claimable(&env, &htlc));
+        env.as_contract(&cid, || claim(&env, htlc.id, pre_image, ben)).unwrap();
+        let stored = env.as_contract(&cid, || get_htlc(&env, htlc.id)).unwrap();
+        assert!(!env.as_contract(&cid, || is_claimable(&env, &stored)));
     }
 
     #[test]
     fn active_htlc_count_zero_for_unknown() {
         let env = Env::default();
+        let cid = env.register_contract(None, crate::TimeLockedUpgradeContract);
         let addr = Address::generate(&env);
-        assert_eq!(active_htlc_count(&env, &addr), 0);
+        assert_eq!(env.as_contract(&cid, || active_htlc_count(&env, &addr)), 0);
     }
 }

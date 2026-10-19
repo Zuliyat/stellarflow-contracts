@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
 
 use crate::ContractError;
 
@@ -16,8 +16,17 @@ pub struct TimelockedWithdrawal {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatorSet {
+    pub sequence: u64,
+    pub keys: Vec<BytesN<32>>,
+}
+
+#[contracttype]
 pub enum TimelockKey {
     Withdrawal(Address),
+    Governance,
+    ValidatorSet,
 }
 
 pub fn queue_withdrawal(env: &Env, receiver: Address, amount: u128) -> TimelockedWithdrawal {
@@ -51,7 +60,10 @@ pub fn cancel_withdrawal(env: &Env, receiver: &Address) -> Result<(), ContractEr
     Ok(())
 }
 
-pub fn execute_withdrawal(env: &Env, receiver: &Address) -> Result<TimelockedWithdrawal, ContractError> {
+pub fn execute_withdrawal(
+    env: &Env,
+    receiver: &Address,
+) -> Result<TimelockedWithdrawal, ContractError> {
     let key = TimelockKey::Withdrawal(receiver.clone());
     let withdrawal: TimelockedWithdrawal = env
         .storage()
@@ -68,13 +80,69 @@ pub fn execute_withdrawal(env: &Env, receiver: &Address) -> Result<TimelockedWit
     Ok(withdrawal)
 }
 
+pub fn initialize_governance(env: &Env, governance: Address) -> Result<(), ContractError> {
+    let key = TimelockKey::Governance;
+    if env.storage().persistent().has(&key) {
+        return Err(ContractError::NoPendingUpgrade);
+    }
+    env.storage().persistent().set(&key, &governance);
+    Ok(())
+}
+
+pub fn get_governance(env: &Env) -> Result<Address, ContractError> {
+    env.storage()
+        .persistent()
+        .get(&TimelockKey::Governance)
+        .ok_or(ContractError::NoPendingUpgrade)
+}
+
+pub fn initialize_validator_set(
+    env: &Env,
+    keys: Vec<BytesN<32>>,
+) -> Result<ValidatorSet, ContractError> {
+    let key = TimelockKey::ValidatorSet;
+    if env.storage().persistent().has(&key) {
+        return Err(ContractError::NoPendingUpgrade);
+    }
+    let validator_set = ValidatorSet { sequence: 0, keys };
+    env.storage().persistent().set(&key, &validator_set);
+    Ok(validator_set)
+}
+
+pub fn rotate_validators(
+    env: &Env,
+    caller: &Address,
+    new_keys: Vec<BytesN<32>>,
+) -> Result<ValidatorSet, ContractError> {
+    let governance = get_governance(env)?;
+    if caller != &governance {
+        return Err(ContractError::NoPendingUpgrade);
+    }
+    caller.require_auth();
+
+    let key = TimelockKey::ValidatorSet;
+    let mut validator_set: ValidatorSet = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(ContractError::NoPendingUpgrade)?;
+    validator_set.sequence += 1;
+    validator_set.keys = new_keys.clone();
+    env.storage().persistent().set(&key, &validator_set);
+
+    let topic = (symbol_short!("vkeys"),);
+    env.events().publish(topic, new_keys);
+
+    Ok(validator_set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
 
     #[test]
-    fn timelocks_large_withdrawals() {
+    fn timelock_blocks_large_withdrawals() {
         let env = Env::default();
         let receiver = Address::generate(&env);
         let w = queue_withdrawal(&env, receiver.clone(), LARGE_TRANSFER_THRESHOLD + 1);

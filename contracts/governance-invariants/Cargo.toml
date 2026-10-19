@@ -1,0 +1,19 @@
+[package]
+name = "governance-invariants"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, default-features = false }
+num-integer = "0.1"
+num-traits = "0.2"
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, default-features = false, features = ["testutils"] }
+num-integer = "0.1"
+num-traits = "0.2"

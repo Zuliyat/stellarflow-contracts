@@ -1,4 +1,13 @@
+pub mod action_queue;
 pub mod cleanup;
+pub mod prune;
+
+pub use action_queue::{
+    cancel_action, execute_action, get_action_timelock_remaining, get_queued_action,
+    queue_admin_action, DynamicFeeConfigParams, FeeCeilingUpdateParams, QueuedActionPayload,
+    QueuedAdminAction, ADMIN_ACTION_DELAY_SECONDS,
+};
+pub use prune::{prune_expired_keys, PruneTarget};
 
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, TryFromVal, Val, Vec};
 use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY, REVOKED_SIGNER_KEY};
@@ -13,6 +22,8 @@ pub(crate) const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 pub(crate) const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
 const ADMIN_CHANGE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60;
+
+const PROPOSAL_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 // ── Per-action admin nonce map ────────────────────────────────────────────────
 
@@ -130,6 +141,23 @@ pub struct AdminChangeProposal {
     pub proposed_at: u64,
 }
 
+/// Lifecycle state for a multi-sig proposal approval window.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalState {
+    Active,
+    Expired,
+}
+
+/// Returns whether the proposal is still inside the 7-day approval window.
+pub fn proposal_state(env: &Env, proposed_at: u64) -> ProposalState {
+    if env.ledger().timestamp().saturating_sub(proposed_at) >= PROPOSAL_EXPIRY_SECONDS {
+        ProposalState::Expired
+    } else {
+        ProposalState::Active
+    }
+}
+
 fn execute_emergency_revocation(
     env: &Env,
     data: ContractData,
@@ -167,9 +195,8 @@ pub fn propose_emergency_revocation(
     proposer: Address,
     target: Address,
     replacement: Address,
-    nonce: u64,
 ) -> Result<(), ContractError> {
-    crate::staging::check_staging_access(env, &current_admin)?;
+    crate::staging::check_staging_access(env, &proposer)?;
     let data: ContractData = env
         .storage()
         .instance()
@@ -187,9 +214,16 @@ pub fn propose_emergency_revocation(
         return Err(ContractError::Unauthorized);
     }
     proposer.require_auth();
-    consume_admin_nonce(env, &proposer, AdminAction::ProposeEmergencyRevocation, nonce)?;
 
-    // Guard: only one active emergency proposal at a time.
+    // Guard: only one active emergency proposal at a time. Purge any expired
+    // temporary proposal first so it cannot mask a fresh one.
+    if let Some(proposal) =
+        get_temp_proposal::<EmergencyRevocationProposal>(env, &EMERGENCY_REVOCATION_TEMP_KEY)
+    {
+        if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
+            remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
+        }
+    }
     if has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY) {
         return Err(ContractError::EmergencyRevocationAlreadyActive);
     }
@@ -239,7 +273,6 @@ pub fn vote_emergency_revocation(
     env: &Env,
     voter: Address,
     sig_expires_at: u64,
-    nonce: u64,
 ) -> Result<(), ContractError> {
     // Reject stale signatures up-front.
     if env.ledger().timestamp() > sig_expires_at {
@@ -259,10 +292,14 @@ pub fn vote_emergency_revocation(
     if data.admin != voter && !is_signer {
         return Err(ContractError::Unauthorized);
     }
-    consume_admin_nonce(env, &voter, AdminAction::VoteEmergencyRevocation, nonce)?;
 
     let mut proposal: EmergencyRevocationProposal = get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
         .ok_or(ContractError::NoActiveEmergencyRevocation)?;
+
+    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
+        remove_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY);
+        return Err(ContractError::NoActiveEmergencyRevocation);
+    }
 
     // Prevent double-voting.
     for i in 0..proposal.votes.len() {
@@ -295,7 +332,13 @@ pub fn vote_emergency_revocation(
 /// Returns the active emergency revocation proposal, if one exists.
 /// Proposals are stored in temporary storage and will auto-purge after TTL.
 pub fn get_emergency_revocation_proposal(env: &Env) -> Option<EmergencyRevocationProposal> {
-    get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
+    let proposal: EmergencyRevocationProposal =
+        get_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)?;
+    if proposal_state(env, proposal.proposed_at) == ProposalState::Expired {
+        None
+    } else {
+        Some(proposal)
+    }
 }
 
 /// Returns `true` if `addr` has been stamped as revoked.
@@ -350,7 +393,10 @@ pub fn purge_emergency_revocation_proposal(env: &Env) -> Result<(), ContractErro
 /// Returns true only if the proposal exists in temporary storage and hasn't expired
 /// according to Soroban's TTL mechanism.
 pub fn has_active_emergency_revocation(env: &Env) -> bool {
-    has_temp_proposal(env, &EMERGENCY_REVOCATION_TEMP_KEY)
+    match get_temp_proposal::<EmergencyRevocationProposal>(env, &EMERGENCY_REVOCATION_TEMP_KEY) {
+        Some(proposal) => proposal_state(env, proposal.proposed_at) == ProposalState::Active,
+        None => false,
+    }
 }
 
 // ─── Issue #429: Two-phase ownership transfer ────────────────────────────────
@@ -361,7 +407,6 @@ pub fn propose_ownership_transfer(
     env: &Env,
     current_admin: Address,
     nominee: Address,
-    nonce: u64,
 ) -> Result<(), ContractError> {
     let data: ContractData = env
         .storage()
@@ -373,7 +418,6 @@ pub fn propose_ownership_transfer(
         return Err(ContractError::NotAdmin);
     }
     current_admin.require_auth();
-    consume_admin_nonce(env, &current_admin, AdminAction::ProposeOwnershipTransfer, nonce)?;
 
     if env.storage().instance().has(&PENDING_OWNER_KEY) {
         return Err(ContractError::TransferAlreadyPending);
@@ -391,7 +435,7 @@ pub fn propose_ownership_transfer(
 
 /// Phase 2: nominee claims ownership, proving key access.
 /// Only succeeds when a pending transfer exists and caller is the nominee.
-pub fn claim_ownership(env: &Env, claimer: Address, nonce: u64) -> Result<(), ContractError> {
+pub fn claim_ownership(env: &Env, claimer: Address) -> Result<(), ContractError> {
     let pending: PendingOwner = env
         .storage()
         .instance()
@@ -402,7 +446,6 @@ pub fn claim_ownership(env: &Env, claimer: Address, nonce: u64) -> Result<(), Co
         return Err(ContractError::NotAdmin);
     }
     claimer.require_auth();
-    consume_admin_nonce(env, &claimer, AdminAction::ClaimOwnership, nonce)?;
 
     let mut data: ContractData = env
         .storage()
@@ -492,7 +535,7 @@ pub fn countersign_admin_change(
     contract_data.admin = proposal.new_admin;
     env.storage().instance().set(&DATA_KEY, &contract_data);
     env.storage().instance().remove(&PENDING_ADMIN_KEY);
-    crate::core::instance::bump_instance_ttl(env);
+    crate::instance::bump_instance_ttl(env);
     Ok(())
 }
 
@@ -510,7 +553,7 @@ pub fn execute_admin_change_by_timelock(
 
     let elapsed = env.ledger().timestamp().saturating_sub(proposal.proposed_at);
     if elapsed < ADMIN_CHANGE_TIMELOCK_SECONDS {
-        return Err(ContractError::AdminChangeTimelockNotSatisfied);
+        return Err(ContractError::AdminTimelockNotSatisfied);
     }
 
     let data: ContractData = env
@@ -568,7 +611,7 @@ pub fn get_pending_admin_change(env: &Env) -> Option<AdminChangeProposal> {
 // ── Emergency pause ───────────────────────────────────────────────────────
 
 /// Emergency stop: verified admin sets the global is_paused flag.
-pub fn set_paused(env: &Env, caller: Address, paused: bool, nonce: u64) -> Result<(), ContractError> {
+pub fn set_paused(env: &Env, caller: Address, paused: bool) -> Result<(), ContractError> {
     let data: ContractData = env
         .storage()
         .instance()
@@ -579,7 +622,6 @@ pub fn set_paused(env: &Env, caller: Address, paused: bool, nonce: u64) -> Resul
         return Err(ContractError::NotAdmin);
     }
     caller.require_auth();
-    consume_admin_nonce(env, &caller, AdminAction::SetPaused, nonce)?;
 
     env.storage().instance().set(&PAUSED_KEY, &paused);
     Ok(())
